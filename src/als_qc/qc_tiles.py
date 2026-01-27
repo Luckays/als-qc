@@ -172,7 +172,7 @@ def mean_z_from_laz(
                 return None, "No Z samples selected"
 
             mean_z = z_scale * (float(total_z_int) / float(used)) + z_offset
-            return mean_z, info
+            return mean_z
 
     except Exception as e:
         return None, f"mean error: {str(e)[:200]}"
