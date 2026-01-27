@@ -306,4 +306,4 @@ def run_tile_report(
 
     print(f"[tile-report] DONE. Main: {out_csv}")
     if out_missing_csv is not None:
-        print(f"[tile-report] Missing/p
+        print(f"[tile-report] Missing/problem: {out_missing_csv}")
