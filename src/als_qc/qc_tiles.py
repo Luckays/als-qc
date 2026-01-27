@@ -172,7 +172,6 @@ def mean_z_from_laz(
                 return None, "No Z samples selected"
 
             mean_z = z_scale * (float(total_z_int) / float(used)) + z_offset
-            info = "" if mode == "full" else f"mean(sample_used={used}, stride={stride}, point_count={n})"
             return mean_z, info
 
     except Exception as e:
@@ -208,8 +207,10 @@ def _process_one_tile(args: Tuple[TileInput, str, int, int]) -> TileResult:
 
     if t.area_m2 and math.isfinite(t.area_m2) and t.area_m2 > 0:
         density = float(n_points) / float(t.area_m2)
+        if density < 40.0:
+            comments.append("Wasserflächen")
     else:
-        comments.append("Invalid tile area (CRS not meters?)")
+        comment_parts.append("Invalid tile area")
 
     return TileResult(
         tile_id=t.tile_id,
@@ -289,7 +290,7 @@ def run_tile_report(
                 "" if r.z_min is None else f"{r.z_min:.3f}",
                 "" if r.z_max is None else f"{r.z_max:.3f}",
                 "" if r.z_mean is None else f"{r.z_mean:.3f}",
-                "" if r.density is None else f"{r.density:.6f}",
+                "" if r.density is None else f"{r.density:.1f}",
                 r.comment,
             ])
 
