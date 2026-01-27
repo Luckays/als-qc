@@ -1,0 +1,4 @@
+geopandas>=0.14
+laspy>=2.5
+lazrs>=0.6
+numpy>=1.24
