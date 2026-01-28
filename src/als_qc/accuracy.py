@@ -230,7 +230,7 @@ def pick_one_point_with_cross(
     ctrl_xyz: np.ndarray,
     point_size: float = 7.0,
     ctrl_color: str = "1,0,0",
-    cross_size_m: float = 0.01,
+    cross_size_m: float = 0.006,
     intensity_auto: bool = True,
     intensity_ignore_zeros: bool = True,
     window_title: str = "Pick point (Shift+LMB, Q)"
@@ -275,7 +275,7 @@ def pick_one_point_with_cross(
     ctrl_vis = (ctrl_pts_world - center) * vis_scale
 
     # Cross size in VIS units
-    cross_size_vis = float(cross_size_m) * float(vis_scale)
+    cross_size_vis = float(cross_size_m) 
 
     # cross points (6 per control) generated in VIS coordinates
     cross_pts_list = []
