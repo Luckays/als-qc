@@ -4,7 +4,7 @@ import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List
 
 import geopandas as gpd
 from shapely.geometry import Point
@@ -26,13 +26,24 @@ class ControlPoint:
 
 
 def _sniff_delimiter(path: Path) -> str:
-    # your file is tab-separated, so default to \t if present in header
     first = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
     if "\t" in first:
         return "\t"
     if ";" in first:
         return ";"
     return ","
+
+
+def _to_float(v: object) -> float:
+    """
+    Robust float parsing:
+    - strips spaces
+    - supports decimal comma
+    - supports numbers stored as strings
+    """
+    s = "" if v is None else str(v).strip()
+    s = s.replace(",", ".")
+    return float(s)
 
 
 def _read_controls(
@@ -44,15 +55,28 @@ def _read_controls(
     kommentar_col: str,
     kommentar_value: str,
     delimiter: Optional[str],
-) -> List[ControlPoint]:
+) -> tuple[list[ControlPoint], list[tuple[str, str]]]:
+    """
+    Returns:
+      controls, bad_rows
+    bad_rows: list of (ctrl_id_or_blank, reason)
+    """
     delim = delimiter if delimiter is not None else _sniff_delimiter(controls_csv)
 
     pts: List[ControlPoint] = []
-    with open(controls_csv, "r", encoding="utf-8", errors="replace", newline="") as f:
+    bad: List[tuple[str, str]] = []
+
+    with open(controls_csv, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         r = csv.DictReader(f, delimiter=delim)
-        missing = [c for c in [id_col, x_col, y_col, kommentar_col] if c not in (r.fieldnames or [])]
+
+        fields = r.fieldnames or []
+        needed = [id_col, x_col, y_col, kommentar_col]
+        if z_col:
+            needed.append(z_col)
+
+        missing = [c for c in needed if c not in fields]
         if missing:
-            raise ValueError(f"Missing columns in controls file: {missing}. Found: {r.fieldnames}")
+            raise ValueError(f"Missing columns in controls file: {missing}. Found: {fields}")
 
         for row in r:
             kommentar = (row.get(kommentar_col) or "").strip()
@@ -63,17 +87,21 @@ def _read_controls(
             if not _MAIN_ID_RE.match(ctrl_id):
                 continue  # only main ids
 
-            x = float(row[x_col])
-            y = float(row[y_col])
-            z = None
-            if z_col:
-                z_raw = row.get(z_col)
-                if z_raw not in (None, ""):
-                    z = float(z_raw)
+            try:
+                x = _to_float(row.get(x_col))
+                y = _to_float(row.get(y_col))
+                z = None
+                if z_col:
+                    z_raw = row.get(z_col)
+                    if z_raw not in (None, ""):
+                        z = _to_float(z_raw)
+            except Exception as e:
+                bad.append((ctrl_id, f"Bad numeric value: {str(e)} (X='{row.get(x_col)}', Y='{row.get(y_col)}')"))
+                continue
 
             pts.append(ControlPoint(ctrl_id=ctrl_id, x=x, y=y, z=z, kommentar=kommentar))
 
-    return pts
+    return pts, bad
 
 
 def prepare_control_clips(
@@ -96,7 +124,7 @@ def prepare_control_clips(
 ) -> None:
     """
     1) Load SHP tiles
-    2) Load controls (only Kommentar contains `kommentar_value` AND main ids ^\\d+$)
+    2) Load controls (Kommentar contains kommentar_value AND main ids ^\\d+$)
     3) Spatial join -> assign tile id
     4) Clip LAZ per control point using LAStools las2las -keep_circle X Y R
     5) Write:
@@ -111,7 +139,7 @@ def prepare_control_clips(
 
     runner = LastoolsRunner(Path(lastools_bin))
 
-    controls = _read_controls(
+    controls, bad_rows = _read_controls(
         controls_csv=controls_csv,
         id_col=id_col,
         x_col=x_col,
@@ -122,14 +150,23 @@ def prepare_control_clips(
         delimiter=delimiter,
     )
 
-    if not controls:
-        raise RuntimeError("No control points selected (check kommentar_value / id format / delimiter).")
-
     tiles_gdf = gpd.read_file(shp_tiles)
     if tile_id_field not in tiles_gdf.columns:
         raise ValueError(f"tile_id_field '{tile_id_field}' not found in SHP. Fields: {list(tiles_gdf.columns)}")
 
-    # Create points geodataframe
+    map_csv = out_dir / "controls_main_kontrolle.csv"
+    err_csv = out_dir / "clip_errors.csv"
+
+    # Prepare points only if any valid controls
+    if not controls:
+        # Still write errors if we have bad rows
+        with open(err_csv, "w", newline="", encoding="utf-8") as fe:
+            we = csv.writer(fe)
+            we.writerow(["Kontrollpunkt_ID", "X", "Y", "Reason"])
+            for cid, reason in bad_rows:
+                we.writerow([cid, "", "", f"Bad control row: {reason}"])
+        raise RuntimeError("No control points selected (check kommentar_value / id format / delimiter).")
+
     pts_gdf = gpd.GeoDataFrame(
         {
             "ctrl_id": [c.ctrl_id for c in controls],
@@ -139,15 +176,11 @@ def prepare_control_clips(
             "Kommentar": [c.kommentar for c in controls],
         },
         geometry=[Point(c.x, c.y) for c in controls],
-        crs=tiles_gdf.crs,  # assume same CRS as tiles
+        crs=tiles_gdf.crs,
     )
 
-    # spatial join (point in polygon)
     joined = gpd.sjoin(pts_gdf, tiles_gdf[[tile_id_field, "geometry"]], how="left", predicate="within")
     joined = joined.rename(columns={tile_id_field: "Kachel_ID"})
-
-    map_csv = out_dir / "controls_main_kontrolle.csv"
-    err_csv = out_dir / "clip_errors.csv"
 
     with open(map_csv, "w", newline="", encoding="utf-8") as fm, open(err_csv, "w", newline="", encoding="utf-8") as fe:
         wm = csv.writer(fm)
@@ -155,6 +188,10 @@ def prepare_control_clips(
 
         wm.writerow(["Kontrollpunkt_ID", "X", "Y", "Z", "Kachel_ID", "Input_LAZ", "Output_LAZ"])
         we.writerow(["Kontrollpunkt_ID", "X", "Y", "Reason"])
+
+        # write bad parsed rows first
+        for cid, reason in bad_rows:
+            we.writerow([cid, "", "", f"Bad control row: {reason}"])
 
         for _, row in joined.iterrows():
             ctrl_id = str(row["ctrl_id"])
