@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import math
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,9 +81,9 @@ def _read_controls_filtered(
                 continue
 
             try:
-                x = float(row[x_col])
-                y = float(row[y_col])
-                z = float(row[z_col])
+                x = float(str(row[x_col]).replace(",", "."))
+                y = float(str(row[y_col]).replace(",", "."))
+                z = float(str(row[z_col]).replace(",", "."))
             except Exception:
                 continue
 
@@ -119,9 +118,11 @@ def build_kdtree_xy(X: np.ndarray, Y: np.ndarray):
     class Naive:
         def __init__(self, xy_):
             self.xy = xy_
+
         def query_ball_point(self, q, r):
             d = np.hypot(self.xy[:, 0] - q[0], self.xy[:, 1] - q[1])
             return np.flatnonzero(d <= r)
+
         def query(self, q, k=1):
             d = np.hypot(self.xy[:, 0] - q[0], self.xy[:, 1] - q[1])
             k = min(k, d.size)
@@ -140,9 +141,11 @@ def build_kdtree_xyz(X: np.ndarray, Y: np.ndarray, Z: np.ndarray):
     class Naive3D:
         def __init__(self, xyz_):
             self.xyz = xyz_
+
         def query_ball_point(self, q, r):
             d = np.linalg.norm(self.xyz - q, axis=1)
             return np.flatnonzero(d <= r)
+
         def query(self, q, k=1):
             d = np.linalg.norm(self.xyz - q, axis=1)
             k = min(k, d.size)
@@ -176,7 +179,7 @@ def select_neighbors_3d(tree, xyz: np.ndarray, q: np.ndarray, k: Optional[int], 
 
 
 # -------------------------
-# Open3D picking with cross markers (simplified but keeps the idea)
+# Open3D picking with cross markers (deterministic top-down)
 # -------------------------
 def _parse_rgb(s: str) -> Tuple[float, float, float]:
     try:
@@ -216,130 +219,121 @@ def _colors_from_intensity_or_z(Z: np.ndarray, I: Optional[np.ndarray], intensit
 
 
 def _make_cross_points(center: np.ndarray, size: float) -> np.ndarray:
-    # 6 points (±X, ±Y, ±Z) around center
     cx, cy, cz = center
-    return np.array([
-        [cx - size, cy, cz], [cx + size, cy, cz],
-        [cx, cy - size, cz], [cx, cy + size, cz],
-        [cx, cy, cz - size], [cx, cy, cz + size],
-    ], dtype=np.float64)
+    return np.array(
+        [
+            [cx - size, cy, cz],
+            [cx + size, cy, cz],
+            [cx, cy - size, cz],
+            [cx, cy + size, cz],
+            [cx, cy, cz - size],
+            [cx, cy, cz + size],
+        ],
+        dtype=np.float64,
+    )
 
 
 def pick_one_point_with_cross(
-    X: np.ndarray, Y: np.ndarray, Z: np.ndarray, I: Optional[np.ndarray],
+    X: np.ndarray,
+    Y: np.ndarray,
+    Z: np.ndarray,
+    I: Optional[np.ndarray],
     ctrl_xyz: np.ndarray,
     point_size: float = 7.0,
     ctrl_color: str = "1,0,0",
-    cross_size_m: float = 0.006,
+    cross_size_m: float = 0.10,  # <-- 10 cm arms (±0.10 m)
     intensity_auto: bool = True,
     intensity_ignore_zeros: bool = True,
-    window_title: str = "Pick point (Shift+LMB, Q)"
+    window_title: str = "Pick point (Shift+LMB, Q)",
 ) -> Optional[Dict[str, float]]:
     """
-    Single PointCloud: [points] + [control points] + [cross points].
-    IMPORTANT:
-      - We center+scale for stable Open3D behavior in large coordinates.
-      - Cross size is specified in meters, but must be scaled by vis_scale to match the scene.
-      - Initial camera + zoom is explicitly set for consistent behavior.
+    Deterministic viewer:
+      - always centered to the control point (ctrl becomes origin)
+      - always TOP-DOWN view initially
+      - cross arms are ±cross_size_m in meters (default 0.10 m)
+      - point size via Open3D RenderOption.point_size (pixels)
+
+    Picking:
+      - if user clicks control/cross point, remap to nearest real cloud point.
     """
     if not HAVE_O3D:
         print("[WARN] Open3D not available -> interactive pick disabled.")
         return None
 
-    pts_xyz = np.column_stack([X, Y, Z]).astype(np.float64, copy=False)
-    n_pts = int(pts_xyz.shape[0])
+    pts_world = np.column_stack([X, Y, Z]).astype(np.float64, copy=False)
+    n_pts = int(pts_world.shape[0])
     if n_pts == 0:
         return None
 
-    ctrl_pts_world = ctrl_xyz.astype(np.float64, copy=False)
-    n_ctrl = int(ctrl_pts_world.shape[0])
-
-    # colors for the real cloud
-    colors_cloud = _colors_from_intensity_or_z(Z, I, intensity_auto=intensity_auto, ignore_zeros=intensity_ignore_zeros)
-
-    # -------------------------
-    # Center & scale FIRST (critical for consistent zoom + marker sizes)
-    # -------------------------
-    all_world = np.vstack([pts_xyz, ctrl_pts_world])
-    mask = np.isfinite(all_world).all(axis=1)
-    if not np.any(mask):
+    ctrl_world = ctrl_xyz.astype(np.float64, copy=False)
+    if ctrl_world.shape[0] < 1:
         return None
 
-    center = all_world[mask].mean(axis=0)
-    centered = all_world - center
-    ranges = np.ptp(centered[mask], axis=0)
-    max_range = float(max(np.max(ranges), 1.0))
-    vis_scale = 2000.0 / max_range
+    # Center EVERYTHING to control point => stable view & stable cross size in meters
+    origin = ctrl_world[0].copy()
+    pts = pts_world - origin
+    ctrl = ctrl_world - origin  # first is [0,0,0]
 
-    pts_vis = (pts_xyz - center) * vis_scale
-    ctrl_vis = (ctrl_pts_world - center) * vis_scale
+    colors_cloud = _colors_from_intensity_or_z(
+        Z, I, intensity_auto=intensity_auto, ignore_zeros=intensity_ignore_zeros
+    )
 
-    # Cross size in VIS units
-    cross_size_vis = float(cross_size_m) * float(vis_scale)
+    n_ctrl = int(ctrl.shape[0])
 
-    # cross points (6 per control) generated in VIS coordinates
-    cross_pts_list = []
+    # cross points around control(s) (expected 1 control here)
     cross_owner: List[int] = []
+    cross_pts_list: List[np.ndarray] = []
     for i in range(n_ctrl):
-        cps = _make_cross_points(ctrl_vis[i], size=cross_size_vis)
+        cps = _make_cross_points(ctrl[i], size=float(cross_size_m))
         cross_pts_list.append(cps)
         cross_owner.extend([i] * cps.shape[0])
 
-    cross_vis = np.vstack(cross_pts_list) if cross_pts_list else np.empty((0, 3), dtype=np.float64)
-    n_cross = int(cross_vis.shape[0])
+    cross_pts = np.vstack(cross_pts_list) if cross_pts_list else np.empty((0, 3), dtype=np.float64)
+    n_cross = int(cross_pts.shape[0])
 
-    # build combined VIS geometry
-    all_vis = np.vstack([pts_vis, ctrl_vis, cross_vis])
+    # combined geometry
+    all_xyz = np.vstack([pts, ctrl, cross_pts])
 
-    # colors: cloud + ctrl red + cross yellow
     ctrl_rgb = np.asarray(_parse_rgb(ctrl_color), dtype=np.float64)
     cross_rgb = np.array([1.0, 1.0, 0.0], dtype=np.float64)
 
-    all_colors = np.vstack([
-        colors_cloud.astype(np.float64),
-        np.repeat(ctrl_rgb[None, :], n_ctrl, axis=0),
-        np.repeat(cross_rgb[None, :], n_cross, axis=0),
-    ])
+    all_colors = np.vstack(
+        [
+            colors_cloud.astype(np.float64),
+            np.repeat(ctrl_rgb[None, :], n_ctrl, axis=0),
+            np.repeat(cross_rgb[None, :], n_cross, axis=0),
+        ]
+    )
 
-    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(all_vis))
-    pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64))
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(all_xyz))
+    pcd.colors = o3d.utility.Vector3dVector(all_colors)
 
-    # -------------------------
-    # Visualizer
-    # -------------------------
     vis = o3d.visualization.VisualizerWithEditing()
     vis.create_window(window_name=window_title, width=1280, height=800)
     vis.add_geometry(pcd)
 
+    # Open3D docs: RenderOption.point_size in pixels
     try:
         ro = vis.get_render_option()
         ro.point_size = float(point_size)
-        ro.background_color = np.array([0, 0, 0], dtype=np.float64)
+        ro.background_color = np.array([0.0, 0.0, 0.0], dtype=np.float64)
     except Exception:
         pass
 
-    # -------------------------
-    # Set initial camera / zoom (fix "zoom feels different")
-    # -------------------------
+    # Deterministic camera: top-down, looking at origin
     try:
         vc = vis.get_view_control()
-        bbox = pcd.get_axis_aligned_bounding_box()
-        lookat = bbox.get_center()
+        vc.set_lookat([0.0, 0.0, 0.0])
+        vc.set_front([0.0, 0.0, -1.0])  # looking down -Z
+        vc.set_up([0.0, 1.0, 0.0])      # Y up on screen
+        vc.set_zoom(0.70)               # fixed zoom for clip radius ~20 m
 
-        vc.set_lookat(lookat)
-        vc.set_up([0.0, 0.0, 1.0])
-        # a stable "from side/top" front vector
-        vc.set_front([0.25, -0.90, 0.35])
-        # IMPORTANT: zoom feels similar across clips
-        vc.set_zoom(0.70)
-
-        # force apply
         vis.poll_events()
         vis.update_renderer()
     except Exception:
         pass
 
-    print(f"[PICK] cloud={n_pts}  controls={n_ctrl}  cross_pts={n_cross}  (Shift+LMB, Q)")
+    print(f"[PICK] cloud={n_pts}  ctrl={n_ctrl}  cross_pts={n_cross}  (Shift+LMB, Q)")
     vis.run()
     picked = vis.get_picked_points()
     vis.destroy_window()
@@ -349,26 +343,25 @@ def pick_one_point_with_cross(
 
     idx = int(picked[0])
 
-    # If clicked beyond real points -> remap to nearest real cloud point (in WORLD coords)
+    # If clicked beyond real points -> remap to nearest real cloud point (WORLD coords)
     if idx >= n_pts:
         if idx < n_pts + n_ctrl:
-            c_world = ctrl_pts_world[idx - n_pts]
+            c_world = ctrl_world[idx - n_pts]
         else:
             which = idx - (n_pts + n_ctrl)
             owner = cross_owner[which]
-            c_world = ctrl_pts_world[owner]
+            c_world = ctrl_world[owner]
 
         if HAVE_SCIPY:
-            tree = KDTree(pts_xyz)
+            tree = KDTree(pts_world)
             _, nn = tree.query(c_world, k=1)
             idx = int(nn)
         else:
-            d = np.linalg.norm(pts_xyz - c_world, axis=1)
+            d = np.linalg.norm(pts_world - c_world, axis=1)
             idx = int(np.argmin(d))
-        print(f"[PICK] clicked control/cross -> nearest cloud point #{idx}")
+        print(f"[PICK] clicked ctrl/cross -> nearest cloud point #{idx}")
 
     return {"idx": idx, "x": float(X[idx]), "y": float(Y[idx]), "z": float(Z[idx])}
-
 
 
 # -------------------------
@@ -452,7 +445,7 @@ def run_accuracy(
     interactive: bool = False,
     point_size: float = 7.0,
     ctrl_color: str = "1,0,0",
-    cross_size_m: float = 0.5,
+    cross_size_m: float = 0.10,  # <-- default 10 cm
     intensity_auto: bool = True,
     intensity_ignore_zeros: bool = True,
     sep: str = ";",
@@ -502,30 +495,18 @@ def run_accuracy(
         laz_path = p1 if p1.exists() else p2
 
         if not laz_path.exists():
-            excluded.append({
-                "Kontrollpunkt_ID": c.ctrl_id,
-                "Reason": "clip not found",
-                "X": c.x, "Y": c.y, "Z": c.z,
-            })
+            excluded.append({"Kontrollpunkt_ID": c.ctrl_id, "Reason": "clip not found", "X": c.x, "Y": c.y, "Z": c.z})
             continue
 
         # load clip
         try:
             X, Y, Z, I = load_pointcloud_as_arrays(laz_path)
         except Exception as e:
-            excluded.append({
-                "Kontrollpunkt_ID": c.ctrl_id,
-                "Reason": f"failed to read clip: {str(e)[:200]}",
-                "X": c.x, "Y": c.y, "Z": c.z,
-            })
+            excluded.append({"Kontrollpunkt_ID": c.ctrl_id, "Reason": f"failed to read clip: {str(e)[:200]}", "X": c.x, "Y": c.y, "Z": c.z})
             continue
 
         if X.size == 0:
-            excluded.append({
-                "Kontrollpunkt_ID": c.ctrl_id,
-                "Reason": "empty clip",
-                "X": c.x, "Y": c.y, "Z": c.z,
-            })
+            excluded.append({"Kontrollpunkt_ID": c.ctrl_id, "Reason": "empty clip", "X": c.x, "Y": c.y, "Z": c.z})
             continue
 
         # height neighbors
@@ -539,11 +520,7 @@ def run_accuracy(
             idxs, _d = select_neighbors_xy(tree, xy, q, k=(k if k > 0 else None), radius=float(radius))
 
         if idxs.size < int(min_points):
-            excluded.append({
-                "Kontrollpunkt_ID": c.ctrl_id,
-                "Reason": f"too few neighbors (n={int(idxs.size)})",
-                "X": c.x, "Y": c.y, "Z": c.z,
-            })
+            excluded.append({"Kontrollpunkt_ID": c.ctrl_id, "Reason": f"too few neighbors (n={int(idxs.size)})", "X": c.x, "Y": c.y, "Z": c.z})
             continue
 
         z_neighbors = Z[idxs]
@@ -552,37 +529,37 @@ def run_accuracy(
         lidar_y = float(np.mean(Y[idxs]))
         dz = lidar_z - c.z
 
-        # If interactive required: enforce pick; otherwise accept height now.
         pick = None
         if interactive:
             ctrl_xyz = np.array([[c.x, c.y, c.z]], dtype=np.float64)
             pick = pick_one_point_with_cross(
-                X=X, Y=Y, Z=Z, I=I,
+                X=X,
+                Y=Y,
+                Z=Z,
+                I=I,
                 ctrl_xyz=ctrl_xyz,
                 point_size=point_size,
                 ctrl_color=ctrl_color,
                 cross_size_m=cross_size_m,
                 intensity_auto=intensity_auto,
                 intensity_ignore_zeros=intensity_ignore_zeros,
-                window_title=f"Pick XY point for Kontrollpunkt {c.ctrl_id} (Shift+LMB, Q)"
+                window_title=f"Pick XY point for Kontrollpunkt {c.ctrl_id} (Shift+LMB, Q)",
             )
             if pick is None:
-                excluded.append({
-                    "Kontrollpunkt_ID": c.ctrl_id,
-                    "Reason": "no pick selected (excluded from Z & XY)",
-                    "X": c.x, "Y": c.y, "Z": c.z,
-                })
+                excluded.append({"Kontrollpunkt_ID": c.ctrl_id, "Reason": "no pick selected (excluded from Z & XY)", "X": c.x, "Y": c.y, "Z": c.z})
                 continue
 
         # store height row (accepted)
-        height_rows.append({
-            "Kontrollpunkt_ID": c.ctrl_id,
-            "Kontrollpunkt_Z": c.z,
-            "LiDAR_X": lidar_x,
-            "LiDAR_Y": lidar_y,
-            "LiDAR_Z": lidar_z,
-            "Differenz Z": dz,
-        })
+        height_rows.append(
+            {
+                "Kontrollpunkt_ID": c.ctrl_id,
+                "Kontrollpunkt_Z": c.z,
+                "LiDAR_X": lidar_x,
+                "LiDAR_Y": lidar_y,
+                "LiDAR_Z": lidar_z,
+                "Differenz Z": dz,
+            }
+        )
         dz_list.append(dz)
 
         # store XY if interactive (accepted)
@@ -591,15 +568,17 @@ def run_accuracy(
             dy = float(pick["y"] - c.y)
             dxy = float(math.hypot(dx, dy))
 
-            xy_rows.append({
-                "Kontrollpunkt_ID": c.ctrl_id,
-                "Kontrollpunkt_X": c.x,
-                "Kontrollpunkt_Y": c.y,
-                "LiDAR_X": float(pick["x"]),
-                "LiDAR_Y": float(pick["y"]),
-                "Differenz X": dx,
-                "Differenz Y": dy,
-            })
+            xy_rows.append(
+                {
+                    "Kontrollpunkt_ID": c.ctrl_id,
+                    "Kontrollpunkt_X": c.x,
+                    "Kontrollpunkt_Y": c.y,
+                    "LiDAR_X": float(pick["x"]),
+                    "LiDAR_Y": float(pick["y"]),
+                    "Differenz X": dx,
+                    "Differenz Y": dy,
+                }
+            )
             dxy_list.append(dxy)
 
     # write outputs
@@ -619,53 +598,72 @@ def run_accuracy(
     _write_rows(
         height_csv,
         height_rows,
-        ["Kontrollpunkt_ID", "Kontrollpunkt_Z", "LiDAR_X", "LiDAR_Y", "LiDAR_Z", "Differenz Z"]
+        ["Kontrollpunkt_ID", "Kontrollpunkt_Z", "LiDAR_X", "LiDAR_Y", "LiDAR_Z", "Differenz Z"],
     )
 
     if interactive:
         _write_rows(
             xy_csv,
             xy_rows,
-            ["Kontrollpunkt_ID", "Kontrollpunkt_X", "Kontrollpunkt_Y", "LiDAR_X", "LiDAR_Y", "Differenz X", "Differenz Y"]
+            ["Kontrollpunkt_ID", "Kontrollpunkt_X", "Kontrollpunkt_Y", "LiDAR_X", "LiDAR_Y", "Differenz X", "Differenz Y"],
         )
     else:
-        # still create empty file for consistency
         _write_rows(
             xy_csv,
             [],
-            ["Kontrollpunkt_ID", "Kontrollpunkt_X", "Kontrollpunkt_Y", "LiDAR_X", "LiDAR_Y", "Differenz X", "Differenz Y"]
+            ["Kontrollpunkt_ID", "Kontrollpunkt_X", "Kontrollpunkt_Y", "LiDAR_X", "LiDAR_Y", "Differenz X", "Differenz Y"],
         )
 
-    _write_rows(
-        excluded_csv,
-        excluded,
-        ["Kontrollpunkt_ID", "Reason", "X", "Y", "Z"]
-    )
+    _write_rows(excluded_csv, excluded, ["Kontrollpunkt_ID", "Reason", "X", "Y", "Z"])
 
     # summaries
     z_summary = _summary_cm_from_errors(np.array(dz_list, dtype=np.float64), use_abs_for_percentile=True)
-    # For XY: summary on dxy magnitudes (meters)
     xy_summary = _summary_cm_from_errors(np.array(dxy_list, dtype=np.float64), use_abs_for_percentile=True)
 
-    # rename EMSE keys
     z_summary_named = dict(z_summary)
     z_summary_named["EMSEz (cm)"] = z_summary_named.pop("EMSE (cm)")
     xy_summary_named = dict(xy_summary)
     xy_summary_named["EMSExy (cm)"] = xy_summary_named.pop("EMSE (cm)")
 
     def _write_summary(path: Path, summ: Dict[str, float]):
-        # stable order
         if "EMSEz (cm)" in summ:
-            order = ["Anzahl der Punkte", "EMSEz (cm)", "Std abw (cm)", "Durchschnitt (cm)", "Median (cm)", "Schiefe", "Min (cm)", "Max (cm)", "95%CI (cm)", "95. Perzentil (cm)"]
+            order = [
+                "Anzahl der Punkte",
+                "EMSEz (cm)",
+                "Std abw (cm)",
+                "Durchschnitt (cm)",
+                "Median (cm)",
+                "Schiefe",
+                "Min (cm)",
+                "Max (cm)",
+                "95%CI (cm)",
+                "95. Perzentil (cm)",
+            ]
         else:
-            order = ["Anzahl der Punkte", "EMSExy (cm)", "Std abw (cm)", "Durchschnitt (cm)", "Median (cm)", "Schiefe", "Min (cm)", "Max (cm)", "95%CI (cm)", "95. Perzentil (cm)"]
+            order = [
+                "Anzahl der Punkte",
+                "EMSExy (cm)",
+                "Std abw (cm)",
+                "Durchschnitt (cm)",
+                "Median (cm)",
+                "Schiefe",
+                "Min (cm)",
+                "Max (cm)",
+                "95%CI (cm)",
+                "95. Perzentil (cm)",
+            ]
 
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter=sep)
             w.writerow(order)
-            w.writerow([f"{summ.get(k, float('nan')):.3f}" if isinstance(summ.get(k, None), (float, int)) and k != "Anzahl der Punkte"
-                        else summ.get(k, "")
-                        for k in order])
+            w.writerow(
+                [
+                    f"{summ.get(k, float('nan')):.3f}"
+                    if isinstance(summ.get(k, None), (float, int)) and k != "Anzahl der Punkte"
+                    else summ.get(k, "")
+                    for k in order
+                ]
+            )
 
     _write_summary(height_sum_csv, z_summary_named)
     _write_summary(xy_sum_csv, xy_summary_named)
