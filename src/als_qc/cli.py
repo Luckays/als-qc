@@ -7,6 +7,14 @@ from als_qc.prepare_clips import prepare_control_clips
 from als_qc.qc_tiles import run_tile_report
 from als_qc.accuracy import run_accuracy
 
+
+def _decode_delimiter(s: str | None) -> str | None:
+    if not s:
+        return None
+    # allows passing "\t" in PowerShell
+    return s.encode("utf-8").decode("unicode_escape")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="als-qc", description="ALS QC utilities")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -16,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -------------------------
     t = sub.add_parser(
         "tile-report",
-        help="Create per-tile statistics CSV (count, Zmin/Zmax/Zmean sample, density)"
+        help="Create per-tile statistics CSV (count, Zmin/Zmax/Zmean, density)"
     )
     t.add_argument("--shp-tiles", required=True, type=Path)
     t.add_argument("--tile-id-field", default="NAME", help="Field name in SHP with Kachel-ID (default: NAME)")
@@ -57,7 +65,6 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--lastools-bin", required=True, type=Path)
     c.add_argument("--clip-radius", type=float, default=20.0, help="Clip radius in meters (default: 20)")
 
-    # columns in controls file
     c.add_argument("--id-col", default="Kontrollpunkt_ID")
     c.add_argument("--x-col", default="X")
     c.add_argument("--y-col", default="Y")
@@ -65,9 +72,51 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--comment-col", default="Kommentar")
     c.add_argument("--comment-value", default="Kontrolle", help="Substring to filter Kommentar (default: Kontrolle)")
 
-    # delimiter: allow passing "\t" etc.
     c.add_argument("--delimiter", default=None, help=r'Optional delimiter, e.g. "\t" or ";" or ","')
     c.add_argument("--overwrite", action="store_true", help="Overwrite existing clips")
+
+    # -------------------------
+    # Step 2: accuracy (Z + optional interactive XY)
+    # -------------------------
+    a = sub.add_parser(
+        "accuracy",
+        help="Accuracy check on per-control clips (height + optional interactive XY)"
+    )
+    a.add_argument("--cloud-dir", required=True, type=Path, help='Directory with clips named "<ID>.laz"')
+    a.add_argument("--controls-csv", required=True, type=Path)
+    a.add_argument("--out-dir", required=True, type=Path)
+
+    a.add_argument("--delimiter", default=None, help=r'Input delimiter, e.g. "\t" or ";" or ","')
+    a.add_argument("--sep", default=";", help="Output CSV separator (default: ;)")
+
+    a.add_argument("--id-col", default="Kontrollpunkt_ID")
+    a.add_argument("--x-col", default="X")
+    a.add_argument("--y-col", default="Y")
+    a.add_argument("--z-col", default="Z")
+    a.add_argument("--comment-col", default="Kommentar")
+    a.add_argument("--comment-value", default="Kontrolle")
+
+    a.add_argument("--main-id-regex", default=r"^\d+$")
+
+    a.add_argument("--k", type=int, default=6)
+    a.add_argument("--radius", type=float, default=0.4)
+    a.add_argument("--min-points", type=int, default=3)
+    a.add_argument("--use-3d-radius", action="store_true")
+
+    a.add_argument("--z-stat", choices=["mean", "median"], default="mean")
+
+    a.add_argument("--interactive", action="store_true")
+    a.add_argument("--point-size", type=float, default=7.0)
+    a.add_argument("--ctrl-color", type=str, default="1,0,0")
+    a.add_argument("--cross-size", type=float, default=0.5)
+
+    a.add_argument("--intensity-auto", action="store_true")
+    a.add_argument("--no-intensity-auto", dest="intensity_auto", action="store_false")
+    a.set_defaults(intensity_auto=True)
+
+    a.add_argument("--intensity-ignore-zeros", action="store_true")
+    a.add_argument("--no-intensity-ignore-zeros", dest="intensity_ignore_zeros", action="store_false")
+    a.set_defaults(intensity_ignore_zeros=True)
 
     return p
 
@@ -92,10 +141,7 @@ def main() -> None:
         return
 
     if args.cmd == "prepare-clips":
-        delimiter = None
-        if args.delimiter:
-            # allows passing "\t" in PowerShell
-            delimiter = args.delimiter.encode("utf-8").decode("unicode_escape")
+        delimiter = _decode_delimiter(args.delimiter)
 
         prepare_control_clips(
             shp_tiles=args.shp_tiles,
@@ -116,7 +162,6 @@ def main() -> None:
             overwrite=args.overwrite,
         )
         return
-
 
     if args.cmd == "accuracy":
         delimiter = _decode_delimiter(args.delimiter)
