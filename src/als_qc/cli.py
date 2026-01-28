@@ -5,7 +5,7 @@ import argparse
 
 from als_qc.prepare_clips import prepare_control_clips
 from als_qc.qc_tiles import run_tile_report
-
+from als_qc.accuracy import run_accuracy
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="als-qc", description="ALS QC utilities")
