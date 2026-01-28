@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--interactive", action="store_true")
     a.add_argument("--point-size", type=float, default=7.0)
     a.add_argument("--ctrl-color", type=str, default="1,0,0")
-    a.add_argument("--cross-size", type=float, default=0.5)
+    a.add_argument("--cross-size", type=float, default=0.1)
 
     a.add_argument("--intensity-auto", action="store_true")
     a.add_argument("--no-intensity-auto", dest="intensity_auto", action="store_false")
