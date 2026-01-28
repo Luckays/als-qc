@@ -230,7 +230,7 @@ def pick_one_point_with_cross(
     ctrl_xyz: np.ndarray,
     point_size: float = 7.0,
     ctrl_color: str = "1,0,0",
-    cross_size_m: float = 0.5,
+    cross_size_m: float = 0.01,
     intensity_auto: bool = True,
     intensity_ignore_zeros: bool = True,
     window_title: str = "Pick point (Shift+LMB, Q)"
