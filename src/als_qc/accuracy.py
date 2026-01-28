@@ -236,8 +236,11 @@ def pick_one_point_with_cross(
     window_title: str = "Pick point (Shift+LMB, Q)"
 ) -> Optional[Dict[str, float]]:
     """
-    Single PointCloud: [points] + [control spheres points] + [cross points].
-    If user clicks a control/cross point, we remap to nearest real cloud point.
+    Single PointCloud: [points] + [control points] + [cross points].
+    IMPORTANT:
+      - We center+scale for stable Open3D behavior in large coordinates.
+      - Cross size is specified in meters, but must be scaled by vis_scale to match the scene.
+      - Initial camera + zoom is explicitly set for consistent behavior.
     """
     if not HAVE_O3D:
         print("[WARN] Open3D not available -> interactive pick disabled.")
@@ -248,55 +251,91 @@ def pick_one_point_with_cross(
     if n_pts == 0:
         return None
 
-    # colors
-    colors = _colors_from_intensity_or_z(Z, I, intensity_auto=intensity_auto, ignore_zeros=intensity_ignore_zeros)
+    ctrl_pts_world = ctrl_xyz.astype(np.float64, copy=False)
+    n_ctrl = int(ctrl_pts_world.shape[0])
 
-    # build extra points for controls + crosses (as points, not meshes -> easier for picking)
-    ctrl_pts = ctrl_xyz.astype(np.float64, copy=False)
-    n_ctrl = int(ctrl_pts.shape[0])
+    # colors for the real cloud
+    colors_cloud = _colors_from_intensity_or_z(Z, I, intensity_auto=intensity_auto, ignore_zeros=intensity_ignore_zeros)
 
-    # cross points (6 per control)
+    # -------------------------
+    # Center & scale FIRST (critical for consistent zoom + marker sizes)
+    # -------------------------
+    all_world = np.vstack([pts_xyz, ctrl_pts_world])
+    mask = np.isfinite(all_world).all(axis=1)
+    if not np.any(mask):
+        return None
+
+    center = all_world[mask].mean(axis=0)
+    centered = all_world - center
+    ranges = np.ptp(centered[mask], axis=0)
+    max_range = float(max(np.max(ranges), 1.0))
+    vis_scale = 2000.0 / max_range
+
+    pts_vis = (pts_xyz - center) * vis_scale
+    ctrl_vis = (ctrl_pts_world - center) * vis_scale
+
+    # Cross size in VIS units
+    cross_size_vis = float(cross_size_m) * float(vis_scale)
+
+    # cross points (6 per control) generated in VIS coordinates
     cross_pts_list = []
-    cross_owner = []
+    cross_owner: List[int] = []
     for i in range(n_ctrl):
-        cps = _make_cross_points(ctrl_pts[i], size=float(cross_size_m))
+        cps = _make_cross_points(ctrl_vis[i], size=cross_size_vis)
         cross_pts_list.append(cps)
         cross_owner.extend([i] * cps.shape[0])
-    cross_pts = np.vstack(cross_pts_list) if cross_pts_list else np.empty((0, 3), dtype=np.float64)
-    n_cross = int(cross_pts.shape[0])
 
-    # combined geometry points
-    all_xyz = np.vstack([pts_xyz, ctrl_pts, cross_pts])
+    cross_vis = np.vstack(cross_pts_list) if cross_pts_list else np.empty((0, 3), dtype=np.float64)
+    n_cross = int(cross_vis.shape[0])
 
-    # colors: cloud colors + control red + cross yellow
+    # build combined VIS geometry
+    all_vis = np.vstack([pts_vis, ctrl_vis, cross_vis])
+
+    # colors: cloud + ctrl red + cross yellow
     ctrl_rgb = np.asarray(_parse_rgb(ctrl_color), dtype=np.float64)
     cross_rgb = np.array([1.0, 1.0, 0.0], dtype=np.float64)
+
     all_colors = np.vstack([
-        colors.astype(np.float64),
+        colors_cloud.astype(np.float64),
         np.repeat(ctrl_rgb[None, :], n_ctrl, axis=0),
         np.repeat(cross_rgb[None, :], n_cross, axis=0),
     ])
 
-    # Center & scale for stable vis (same idea as original)
-    mask = np.isfinite(all_xyz).all(axis=1)
-    xyz = all_xyz[mask]
-    center = xyz.mean(axis=0)
-    centered = all_xyz - center
-    ranges = np.ptp(centered[mask], axis=0)
-    max_range = float(max(np.max(ranges), 1.0))
-    vis_scale = 2000.0 / max_range
-    all_vis = centered * vis_scale
-
     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(all_vis))
     pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64))
 
+    # -------------------------
+    # Visualizer
+    # -------------------------
     vis = o3d.visualization.VisualizerWithEditing()
     vis.create_window(window_name=window_title, width=1280, height=800)
     vis.add_geometry(pcd)
+
     try:
         ro = vis.get_render_option()
         ro.point_size = float(point_size)
-        ro.background_color = np.array([0, 0, 0])
+        ro.background_color = np.array([0, 0, 0], dtype=np.float64)
+    except Exception:
+        pass
+
+    # -------------------------
+    # Set initial camera / zoom (fix "zoom feels different")
+    # -------------------------
+    try:
+        vc = vis.get_view_control()
+        bbox = pcd.get_axis_aligned_bounding_box()
+        lookat = bbox.get_center()
+
+        vc.set_lookat(lookat)
+        vc.set_up([0.0, 0.0, 1.0])
+        # a stable "from side/top" front vector
+        vc.set_front([0.25, -0.90, 0.35])
+        # IMPORTANT: zoom feels similar across clips
+        vc.set_zoom(0.70)
+
+        # force apply
+        vis.poll_events()
+        vis.update_renderer()
     except Exception:
         pass
 
@@ -310,14 +349,14 @@ def pick_one_point_with_cross(
 
     idx = int(picked[0])
 
-    # if clicked beyond real points -> remap to nearest real cloud point
+    # If clicked beyond real points -> remap to nearest real cloud point (in WORLD coords)
     if idx >= n_pts:
         if idx < n_pts + n_ctrl:
-            c_world = ctrl_pts[idx - n_pts]
+            c_world = ctrl_pts_world[idx - n_pts]
         else:
             which = idx - (n_pts + n_ctrl)
             owner = cross_owner[which]
-            c_world = ctrl_pts[owner]
+            c_world = ctrl_pts_world[owner]
 
         if HAVE_SCIPY:
             tree = KDTree(pts_xyz)
@@ -329,6 +368,7 @@ def pick_one_point_with_cross(
         print(f"[PICK] clicked control/cross -> nearest cloud point #{idx}")
 
     return {"idx": idx, "x": float(X[idx]), "y": float(Y[idx]), "z": float(Z[idx])}
+
 
 
 # -------------------------
