@@ -208,7 +208,7 @@ def _process_one_tile(args: Tuple[TileInput, str, int, int]) -> TileResult:
     if t.area_m2 and math.isfinite(t.area_m2) and t.area_m2 > 0:
         density = float(n_points) / float(t.area_m2)
         if density < 40.0:
-            comments.append("Wasserflächen")
+            comments.append("Check")
     else:
         comment_parts.append("Invalid tile area")
 
