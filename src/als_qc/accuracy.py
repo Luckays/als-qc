@@ -288,13 +288,7 @@ def pick_one_point_with_cross(
         cross_pts_list.append(cps)
         cross_owner.extend([i] * cps.shape[0])
 
-        # --- DEBUG: ověř délku ramen (v tom samém prostoru, co jde do O3D) ---
-    arm_x = float(np.linalg.norm(cps[1] - ctrl[i]))  # +X bod
-    arm_y = float(np.linalg.norm(cps[3] - ctrl[i]))  # +Y bod
-    arm_z = float(np.linalg.norm(cps[5] - ctrl[i]))  # +Z bod
-    print(f"[DEBUG] cross_size_m param = {cross_size_m}")
-    print(f"[DEBUG] arm lengths (x,y,z) = {arm_x:.6f}, {arm_y:.6f}, {arm_z:.6f}")
-    
+
     cross_pts = np.vstack(cross_pts_list) if cross_pts_list else np.empty((0, 3), dtype=np.float64)
     n_cross = int(cross_pts.shape[0])
 
