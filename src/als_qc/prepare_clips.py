@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import csv
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon
 
 from als_qc.lastools import LastoolsRunner
 from als_qc.qc_tiles import resolve_laz_path
@@ -55,7 +56,7 @@ def _read_controls(
     kommentar_col: str,
     kommentar_value: str,
     delimiter: Optional[str],
-) -> tuple[list[ControlPoint], list[tuple[str, str]]]:
+) -> Tuple[List[ControlPoint], List[Tuple[str, str]]]:
     """
     Returns:
       controls, bad_rows
@@ -64,7 +65,7 @@ def _read_controls(
     delim = delimiter if delimiter is not None else _sniff_delimiter(controls_csv)
 
     pts: List[ControlPoint] = []
-    bad: List[tuple[str, str]] = []
+    bad: List[Tuple[str, str]] = []
 
     with open(controls_csv, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         r = csv.DictReader(f, delimiter=delim)
@@ -104,6 +105,32 @@ def _read_controls(
     return pts, bad
 
 
+def _square_polygon(x: float, y: float, half_size: float) -> Polygon:
+    """
+    Create square polygon centered at (x, y) with half-size (meters).
+    """
+    hs = float(half_size)
+    return Polygon([
+        (x - hs, y - hs),
+        (x + hs, y - hs),
+        (x + hs, y + hs),
+        (x - hs, y + hs),
+        (x - hs, y - hs),
+    ])
+
+
+def _find_lastools_exe(runner: LastoolsRunner, candidates: List[str]) -> Path:
+    """
+    Return first existing exe from candidates inside lastools bin.
+    Raise RuntimeError if none exists.
+    """
+    for name in candidates:
+        p = runner.exe(name)
+        if p.exists():
+            return p
+    raise RuntimeError(f"Cannot find LAStools exe in {runner.bin_dir}. Tried: {candidates}")
+
+
 def prepare_control_clips(
     shp_tiles: Path,
     tile_id_field: str,
@@ -126,7 +153,8 @@ def prepare_control_clips(
     1) Load SHP tiles
     2) Load controls (Kommentar contains kommentar_value AND main ids ^\\d+$)
     3) Spatial join -> assign tile id
-    4) Clip LAZ per control point using LAStools las2las -keep_circle X Y R
+    4) Clip LAZ per control point using LAStools lasclip -poly <temp_shp>
+       (polygon is a square with half-size = clip_radius_m around point)
     5) Write:
        - controls_main_kontrolle.csv (with tile + input laz + output laz)
        - clip_errors.csv (problems)
@@ -138,6 +166,9 @@ def prepare_control_clips(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     runner = LastoolsRunner(Path(lastools_bin))
+
+    # Find lasclip executable robustly
+    lasclip_exe = _find_lastools_exe(runner, ["lasclip64.exe", "lasclip.exe", "lasclip"])
 
     controls, bad_rows = _read_controls(
         controls_csv=controls_csv,
@@ -157,9 +188,8 @@ def prepare_control_clips(
     map_csv = out_dir / "controls_main_kontrolle.csv"
     err_csv = out_dir / "clip_errors.csv"
 
-    # Prepare points only if any valid controls
+    # If none valid controls, write errors and stop
     if not controls:
-        # Still write errors if we have bad rows
         with open(err_csv, "w", newline="", encoding="utf-8") as fe:
             we = csv.writer(fe)
             we.writerow(["Kontrollpunkt_ID", "X", "Y", "Reason"])
@@ -167,6 +197,7 @@ def prepare_control_clips(
                 we.writerow([cid, "", "", f"Bad control row: {reason}"])
         raise RuntimeError("No control points selected (check kommentar_value / id format / delimiter).")
 
+    # Prepare points geodataframe
     pts_gdf = gpd.GeoDataFrame(
         {
             "ctrl_id": [c.ctrl_id for c in controls],
@@ -181,6 +212,16 @@ def prepare_control_clips(
 
     joined = gpd.sjoin(pts_gdf, tiles_gdf[[tile_id_field, "geometry"]], how="left", predicate="within")
     joined = joined.rename(columns={tile_id_field: "Kachel_ID"})
+
+    # Counters
+    n_ok = 0
+    n_skip_exists = 0
+    n_missing_laz = 0
+    n_outside = 0
+    n_fail = 0
+    n_bad_rows = len(bad_rows)
+
+    tiles_crs = tiles_gdf.crs  # keep CRS for temp shapefile
 
     with open(map_csv, "w", newline="", encoding="utf-8") as fm, open(err_csv, "w", newline="", encoding="utf-8") as fe:
         wm = csv.writer(fm)
@@ -200,37 +241,69 @@ def prepare_control_clips(
             kachel = row.get("Kachel_ID")
 
             if kachel is None or (isinstance(kachel, float) and str(kachel) == "nan"):
+                n_outside += 1
                 we.writerow([ctrl_id, x, y, "Point not inside any tile polygon"])
                 continue
 
             kachel_id = str(kachel)
             input_laz = resolve_laz_path(Path(laz_dir), laz_pattern, kachel_id)
             if not input_laz.exists():
+                n_missing_laz += 1
                 we.writerow([ctrl_id, x, y, f"Input LAZ not found: {input_laz.name}"])
                 continue
 
             out_laz = (out_dir / f"{ctrl_id}.laz").resolve()
             if out_laz.exists() and not overwrite:
+                n_skip_exists += 1
                 wm.writerow([ctrl_id, x, y, row.get("Z"), kachel_id, str(input_laz), str(out_laz)])
                 continue
 
-            exe = str(runner.exe("las2las64.exe"))
-            cmd = [
-                exe,
-                "-i", str(input_laz),
-                "-keep_circle", f"{x}", f"{y}", f"{clip_radius_m}",
-                "-olaz",
-                "-o", str(out_laz),
-                "-quiet",
-            ]
-            res = runner.run(cmd)
+            # Build temp polygon shapefile (square) + clip using lasclip
+            poly = _square_polygon(x, y, half_size=clip_radius_m)
 
-            if res.returncode != 0:
-                we.writerow([ctrl_id, x, y, f"las2las failed: {res.stderr[:200]}"])
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    td = Path(td)
+                    poly_shp = td / "clip.shp"
+                    gpd.GeoDataFrame({"id": [1]}, geometry=[poly], crs=tiles_crs).to_file(poly_shp)
+
+                    cmd = [
+                        str(lasclip_exe),
+                        "-i", str(input_laz),
+                        "-poly", str(poly_shp),
+                        "-olaz",
+                        "-o", str(out_laz),
+                    ]
+                    res = runner.run(cmd)
+
+                if res.returncode != 0:
+                    n_fail += 1
+                    # keep more stderr; it's usually short
+                    err = (res.stderr or res.stdout or "").strip()
+                    if len(err) > 500:
+                        err = err[:500]
+                    we.writerow([ctrl_id, x, y, f"lasclip failed (rc={res.returncode}): {err}"])
+                    continue
+
+                # Some LAStools variants might succeed but output empty file; detect quickly
+                if not out_laz.exists() or out_laz.stat().st_size == 0:
+                    n_fail += 1
+                    we.writerow([ctrl_id, x, y, "lasclip produced no output (missing/empty file)"])
+                    continue
+
+                n_ok += 1
+                wm.writerow([ctrl_id, x, y, row.get("Z"), kachel_id, str(input_laz), str(out_laz)])
+
+            except Exception as e:
+                n_fail += 1
+                we.writerow([ctrl_id, x, y, f"clip exception: {str(e)[:300]}"])
                 continue
-
-            wm.writerow([ctrl_id, x, y, row.get("Z"), kachel_id, str(input_laz), str(out_laz)])
 
     print(f"[prepare-clips] DONE. Clips in: {out_dir}")
     print(f"[prepare-clips] Mapping: {map_csv}")
     print(f"[prepare-clips] Errors: {err_csv}")
+    print(
+        "[prepare-clips] Summary: "
+        f"OK={n_ok}, exists-skip={n_skip_exists}, missing-LAZ={n_missing_laz}, "
+        f"outside-tiles={n_outside}, bad-rows={n_bad_rows}, clip-fail={n_fail}"
+    )
