@@ -275,7 +275,7 @@ def pick_one_point_with_cross(
     ctrl_vis = (ctrl_pts_world - center) * vis_scale
 
     # Cross size in VIS units
-    cross_size_vis = float(cross_size_m) 
+    cross_size_vis = float(cross_size_m) * float(vis_scale)
 
     # cross points (6 per control) generated in VIS coordinates
     cross_pts_list = []
