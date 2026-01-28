@@ -117,6 +117,37 @@ def main() -> None:
         )
         return
 
+
+    if args.cmd == "accuracy":
+        delimiter = _decode_delimiter(args.delimiter)
+
+        run_accuracy(
+            cloud_dir=args.cloud_dir,
+            controls_csv=args.controls_csv,
+            out_dir=args.out_dir,
+            delimiter=delimiter,
+            id_col=args.id_col,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            z_col=args.z_col,
+            comment_col=args.comment_col,
+            comment_value=args.comment_value,
+            main_id_regex=args.main_id_regex,
+            k=args.k,
+            radius=args.radius,
+            use_3d_radius=bool(args.use_3d_radius),
+            min_points=args.min_points,
+            z_stat=args.z_stat,
+            interactive=bool(args.interactive),
+            point_size=args.point_size,
+            ctrl_color=args.ctrl_color,
+            cross_size_m=args.cross_size,
+            intensity_auto=bool(args.intensity_auto),
+            intensity_ignore_zeros=bool(args.intensity_ignore_zeros),
+            sep=args.sep,
+        )
+        return
+
     raise SystemExit("Unknown command")
 
 
