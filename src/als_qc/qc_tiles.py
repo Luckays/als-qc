@@ -255,6 +255,8 @@ def run_tile_report(
         out_missing_csv.parent.mkdir(parents=True, exist_ok=True)
 
     tiles = load_tiles_from_shp(shp_tiles, tile_id_field)
+    print(f"[tile-report] SHP loaded: {shp_tiles}")
+    print(f"[tile-report] tiles in SHP: {len(tiles)}")
     inputs: List[TileInput] = []
     for tile_id, area_m2 in tiles:
         laz_path = resolve_laz_path(laz_dir, laz_pattern, tile_id)
